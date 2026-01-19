@@ -8,7 +8,7 @@ services:
     region: oregon
     plan: starter
     buildCommand: pip install -e .
-    startCommand: python -m blok_mcp
+    startCommand: python -m blok_mcp.http_server
     envVars:
       - key: BLOK_MCP_BLOK_API_URL
         value: https://app.joinblok.co
