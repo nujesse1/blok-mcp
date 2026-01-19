@@ -67,13 +67,45 @@ def create_app() -> Starlette:
         """Health check endpoint for Render."""
         return JSONResponse({"status": "ok", "service": "blok-mcp"})
 
+    async def oauth_metadata(request: Request):
+        """OAuth 2.0 Authorization Server Metadata (RFC 8414).
+
+        Returns minimal metadata indicating we use header-based auth.
+        """
+        base_url = str(request.base_url).rstrip("/")
+        return JSONResponse({
+            "issuer": base_url,
+            "authorization_endpoint": f"{base_url}/oauth/authorize",
+            "token_endpoint": f"{base_url}/oauth/token",
+            "response_types_supported": ["code"],
+            "grant_types_supported": ["authorization_code"],
+            "code_challenge_methods_supported": ["S256"],
+        })
+
+    async def oauth_authorize(request: Request):
+        """OAuth authorize endpoint - not used, we use header auth."""
+        return JSONResponse(
+            {"error": "unsupported_grant_type", "error_description": "Use X-Session-Token header"},
+            status_code=400
+        )
+
+    async def oauth_token(request: Request):
+        """OAuth token endpoint - not used, we use header auth."""
+        return JSONResponse(
+            {"error": "unsupported_grant_type", "error_description": "Use X-Session-Token header"},
+            status_code=400
+        )
+
     # Create routes
     routes = [
         Route("/health", health_check, methods=["GET"]),
         Route("/sse/", handle_sse, methods=["GET"]),
-        Route("/messages/", handle_messages, methods=["POST"]),
-        # Also support /sse without trailing slash
         Route("/sse", handle_sse, methods=["GET"]),
+        Route("/messages/", handle_messages, methods=["POST"]),
+        # OAuth endpoints (stubs for Claude Code compatibility)
+        Route("/.well-known/oauth-authorization-server", oauth_metadata, methods=["GET"]),
+        Route("/oauth/authorize", oauth_authorize, methods=["GET", "POST"]),
+        Route("/oauth/token", oauth_token, methods=["POST"]),
     ]
 
     app = Starlette(
