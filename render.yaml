@@ -1,0 +1,20 @@
+# Render deployment configuration for Blok MCP Server
+# https://render.com/docs/blueprint-spec
+
+services:
+  - type: web
+    name: blok-mcp-server
+    runtime: python
+    region: oregon
+    plan: starter
+    buildCommand: pip install -e .
+    startCommand: python -m blok_mcp
+    envVars:
+      - key: BLOK_MCP_BLOK_API_URL
+        value: https://app.joinblok.co
+      - key: BLOK_MCP_DEBUG
+        value: "false"
+      - key: PYTHON_VERSION
+        value: "3.11"
+    healthCheckPath: /health
+    autoDeploy: true
