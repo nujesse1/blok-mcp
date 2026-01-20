@@ -2,6 +2,9 @@
 
 import logging
 import sys
+import uuid
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Any, Optional
 
 from mcp.server import Server
@@ -22,6 +25,26 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ExperimentPlan:
+    """Stores a pending experiment plan awaiting confirmation."""
+    plan_id: str
+    created_at: datetime
+    title: str
+    hypothesis: str
+    goal: str
+    url: str
+    experiment_type_id: str
+    experiment_type_name: str
+    persona_ids: list[str]
+    persona_names: list[str]
+    frame_type: str
+    credentials_provided: bool
+    credential_username: str | None
+    credential_password: str | None
+    credentials_likely_needed: bool
 
 
 class BlokMCPServer:
@@ -60,6 +83,9 @@ class BlokMCPServer:
 
         # Store active ngrok tunnels
         self.ngrok_tunnels: dict[str, Any] = {}  # port -> tunnel object
+
+        # Store pending experiment plans (1-hour expiration)
+        self.pending_plans: dict[str, ExperimentPlan] = {}
 
         # Register handlers
         # The SDK will automatically expose tool capabilities based on registered handlers
@@ -354,6 +380,147 @@ class BlokMCPServer:
                         "required": [],
                     },
                 ),
+                Tool(
+                    name="plan_experiment",
+                    description=(
+                        "Plan a Blok experiment without running it. Returns a summary with credential status "
+                        "and a plan_id for confirmation. Use confirm_and_run_experiment to execute the plan. "
+                        "This two-step flow allows reviewing experiment details before execution."
+                    ),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "hypothesis": {
+                                "type": "string",
+                                "description": "Test objective - what you want to understand about user interactions",
+                            },
+                            "goal": {
+                                "type": "string",
+                                "description": "User goal - what outcome should agents work toward",
+                            },
+                            "url": {
+                                "type": "string",
+                                "description": "Interface URL to test",
+                            },
+                            "persona_ids": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Array of persona UUIDs to run simulations with",
+                            },
+                            "title": {
+                                "type": "string",
+                                "description": "Experiment title (optional - will be auto-generated if not provided)",
+                            },
+                            "experiment_type_id": {
+                                "type": "string",
+                                "description": "Experiment type UUID (optional - will be auto-suggested if not provided)",
+                            },
+                            "frame_type": {
+                                "type": "string",
+                                "enum": ["Desktop", "Mobile"],
+                                "description": "Device type for simulation (default: Desktop)",
+                            },
+                            "credential_username": {
+                                "type": "string",
+                                "description": "Username for protected content (optional)",
+                            },
+                            "credential_password": {
+                                "type": "string",
+                                "description": "Password for protected content (optional)",
+                            },
+                            "email": {
+                                "type": "string",
+                                "description": "User email (only if not already authenticated)",
+                            },
+                            "password": {
+                                "type": "string",
+                                "description": "User password (only if not already authenticated)",
+                            },
+                        },
+                        "required": ["hypothesis", "goal", "url", "persona_ids"],
+                    },
+                ),
+                Tool(
+                    name="confirm_and_run_experiment",
+                    description=(
+                        "Run a previously planned experiment. Takes a plan_id from plan_experiment "
+                        "and optionally accepts credentials if not provided in the original plan."
+                    ),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "plan_id": {
+                                "type": "string",
+                                "description": "The plan_id returned by plan_experiment",
+                            },
+                            "credential_username": {
+                                "type": "string",
+                                "description": "Username for protected content (if not provided in plan)",
+                            },
+                            "credential_password": {
+                                "type": "string",
+                                "description": "Password for protected content (if not provided in plan)",
+                            },
+                            "email": {
+                                "type": "string",
+                                "description": "User email (only if not already authenticated)",
+                            },
+                            "password": {
+                                "type": "string",
+                                "description": "User password (only if not already authenticated)",
+                            },
+                        },
+                        "required": ["plan_id"],
+                    },
+                ),
+                Tool(
+                    name="plan_experiment_from_description",
+                    description=(
+                        "Plan a Blok experiment from natural language without running it. "
+                        "Returns a summary with credential status and a plan_id for confirmation. "
+                        "Use confirm_and_run_experiment to execute the plan."
+                    ),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "test_description": {
+                                "type": "string",
+                                "description": "What to test in natural language (e.g., 'successfully complete checkout')",
+                            },
+                            "url": {
+                                "type": "string",
+                                "description": "Website URL to test",
+                            },
+                            "persona_ids": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Persona UUIDs to test with",
+                            },
+                            "frame_type": {
+                                "type": "string",
+                                "enum": ["Desktop", "Mobile"],
+                                "description": "Device type (default: Desktop)",
+                            },
+                            "credential_username": {
+                                "type": "string",
+                                "description": "Username for protected content (optional)",
+                            },
+                            "credential_password": {
+                                "type": "string",
+                                "description": "Password for protected content (optional)",
+                            },
+                            "email": {
+                                "type": "string",
+                                "description": "User email (only if not already authenticated)",
+                            },
+                            "password": {
+                                "type": "string",
+                                "description": "User password (only if not already authenticated)",
+                            },
+                        },
+                        "required": ["test_description", "url", "persona_ids"],
+                    },
+                ),
             ]
 
         @self.server.call_tool()
@@ -379,6 +546,12 @@ class BlokMCPServer:
                 return await self._get_ngrok_status(arguments)
             elif name == "stop_ngrok":
                 return await self._stop_ngrok(arguments)
+            elif name == "plan_experiment":
+                return await self._plan_experiment(arguments)
+            elif name == "confirm_and_run_experiment":
+                return await self._confirm_and_run_experiment(arguments)
+            elif name == "plan_experiment_from_description":
+                return await self._plan_experiment_from_description(arguments)
             else:
                 raise ValueError(f"Unknown tool: {name}")
 
@@ -461,6 +634,62 @@ Session active. Future tool calls will use this session automatically."""
                 return False
 
         return False
+
+    def _suggest_credentials_needed(self, url: str, goal: str, hypothesis: str) -> bool:
+        """Heuristically determine if credentials are likely needed for this test.
+
+        Checks URL paths and goal/hypothesis text for auth-related keywords.
+
+        Args:
+            url: The URL being tested
+            goal: The experiment goal
+            hypothesis: The experiment hypothesis
+
+        Returns:
+            True if credentials are likely needed
+        """
+        # URL path patterns that suggest authentication
+        auth_url_patterns = [
+            "/login", "/signin", "/sign-in", "/sign_in",
+            "/account", "/dashboard", "/profile", "/settings",
+            "/checkout", "/cart", "/payment", "/order",
+            "/admin", "/portal", "/my-", "/my_",
+            "/auth", "/oauth", "/sso",
+        ]
+
+        # Text keywords that suggest authentication
+        auth_keywords = [
+            "login", "log in", "sign in", "signin", "authenticate",
+            "account", "dashboard", "profile", "settings",
+            "checkout", "purchase", "buy", "payment", "cart", "order",
+            "member", "subscription", "premium",
+            "admin", "portal", "private", "protected",
+        ]
+
+        # Check URL
+        url_lower = url.lower()
+        for pattern in auth_url_patterns:
+            if pattern in url_lower:
+                return True
+
+        # Check goal and hypothesis
+        combined_text = f"{goal} {hypothesis}".lower()
+        for keyword in auth_keywords:
+            if keyword in combined_text:
+                return True
+
+        return False
+
+    def _cleanup_old_plans(self) -> None:
+        """Remove plans older than 1 hour."""
+        cutoff = datetime.now() - timedelta(hours=1)
+        expired_ids = [
+            plan_id for plan_id, plan in self.pending_plans.items()
+            if plan.created_at < cutoff
+        ]
+        for plan_id in expired_ids:
+            del self.pending_plans[plan_id]
+            logger.info(f"Cleaned up expired plan: {plan_id}")
 
     async def _list_personas(self, arguments: dict) -> list[TextContent]:
         """List all available personas.
@@ -1269,6 +1498,450 @@ start_experiment(url="{public_url}", ...)"""
         except Exception as e:
             error_msg = f"Error stopping ngrok: {str(e)}"
             logger.exception("Error in stop_ngrok")
+            return [TextContent(type="text", text=error_msg)]
+
+    async def _plan_experiment(self, arguments: dict) -> list[TextContent]:
+        """Plan an experiment without running it.
+
+        Validates parameters, stores the plan, and returns a summary for user review.
+
+        Args:
+            arguments: Dictionary with experiment parameters
+
+        Returns:
+            List containing experiment plan summary with plan_id
+        """
+        try:
+            # Clean up old plans first
+            self._cleanup_old_plans()
+
+            # Ensure authenticated
+            if not await self._ensure_authenticated(arguments):
+                return [TextContent(
+                    type="text",
+                    text="Error: Not authenticated. Please provide email and password, or call whoami first."
+                )]
+
+            # Get authenticated client
+            client = self.session_manager.get_client()
+
+            # Extract and validate required parameters
+            hypothesis = arguments.get("hypothesis", "").strip()
+            goal = arguments.get("goal", "").strip()
+            url = arguments.get("url", "").strip()
+            persona_ids = arguments.get("persona_ids", [])
+
+            if not hypothesis:
+                return [TextContent(type="text", text="Error: hypothesis is required")]
+            if not goal:
+                return [TextContent(type="text", text="Error: goal is required")]
+            if not url:
+                return [TextContent(type="text", text="Error: url is required")]
+            if not persona_ids or len(persona_ids) == 0:
+                return [TextContent(type="text", text="Error: At least one persona_id is required")]
+
+            # Normalize URL
+            if not url.startswith("http://") and not url.startswith("https://"):
+                url = f"https://{url}"
+
+            # Extract optional parameters
+            title = arguments.get("title", "").strip() or None
+            experiment_type_id = arguments.get("experiment_type_id", "").strip() or None
+            frame_type = arguments.get("frame_type", "Desktop")
+            credential_username = arguments.get("credential_username", "").strip() or None
+            credential_password = arguments.get("credential_password", "").strip() or None
+
+            logger.info(f"Planning experiment: {title or 'Untitled'}")
+
+            # Fetch personas for name resolution
+            personas_response = await client.get("/personas", params={"limit": 100})
+            all_personas = personas_response.get("personas", personas_response) if isinstance(personas_response, dict) else personas_response
+            selected_personas = [p for p in all_personas if p.get("id") in persona_ids]
+            persona_names = [p.get("name", "Unknown") for p in selected_personas]
+
+            # Fetch experiment types
+            exp_types_response = await client.get("/experiments/types")
+
+            # If no type or title provided, call LLM suggestion endpoint
+            experiment_type_name = ""
+            if not experiment_type_id or not title:
+                logger.info("Fetching LLM suggestions for type/title...")
+
+                suggestion_payload = {
+                    "experimentTitle": title,
+                    "hypothesis": hypothesis,
+                    "goal": goal,
+                    "url": url,
+                    "frame_type": frame_type,
+                    "personas": [
+                        {
+                            "id": p.get("id"),
+                            "name": p.get("name", ""),
+                            "description": p.get("description", ""),
+                            "traits": p.get("traits", {}),
+                            "tendencies": p.get("tendencies", []),
+                            "participants": p.get("participants", 0),
+                        }
+                        for p in selected_personas
+                    ],
+                    "availableExperimentTypes": [
+                        {
+                            "id": et.get("id"),
+                            "name": et.get("name"),
+                            "instructions": et.get("instructions"),
+                            "success_indicators": None,
+                            "prompt_specifics": None,
+                        }
+                        for et in exp_types_response
+                    ],
+                }
+
+                suggestion_result = await client.post("/experiments/types/suggest", json=suggestion_payload)
+
+                if not experiment_type_id:
+                    experiment_type_id = suggestion_result.get("suggested_experiment_type_id")
+                    if not experiment_type_id:
+                        return [TextContent(type="text", text="Error: Failed to auto-suggest experiment type")]
+
+                if not title:
+                    title = suggestion_result.get("suggested_title")
+                    if not title:
+                        return [TextContent(type="text", text="Error: Failed to auto-generate title")]
+
+            # Get experiment type name
+            for et in exp_types_response:
+                if et.get("id") == experiment_type_id:
+                    experiment_type_name = et.get("name", "")
+                    break
+
+            # Check if credentials are likely needed
+            credentials_provided = bool(credential_username or credential_password)
+            credentials_likely_needed = self._suggest_credentials_needed(url, goal, hypothesis)
+
+            # Generate plan ID
+            plan_id = f"plan_{uuid.uuid4().hex[:12]}"
+
+            # Store plan
+            plan = ExperimentPlan(
+                plan_id=plan_id,
+                created_at=datetime.now(),
+                title=title,
+                hypothesis=hypothesis,
+                goal=goal,
+                url=url,
+                experiment_type_id=experiment_type_id,
+                experiment_type_name=experiment_type_name,
+                persona_ids=persona_ids,
+                persona_names=persona_names,
+                frame_type=frame_type,
+                credentials_provided=credentials_provided,
+                credential_username=credential_username,
+                credential_password=credential_password,
+                credentials_likely_needed=credentials_likely_needed,
+            )
+            self.pending_plans[plan_id] = plan
+
+            # Calculate estimated runtime
+            num_personas = len(persona_ids)
+            estimated_minutes = round(5 + 7.2 * (0.5 + num_personas))
+
+            # Build output
+            output = "I've prepared an experiment plan:\n\n"
+            output += f"Title: {title}\n"
+            output += f"URL: {url}\n"
+            output += f"Goal: {goal}\n"
+            output += f"Hypothesis: {hypothesis}\n"
+            output += f"Personas: {', '.join(persona_names)}\n"
+            output += f"Device: {frame_type}\n"
+
+            if credentials_provided:
+                output += f"Credentials: Configured (username: {credential_username})\n"
+
+            output += f"Estimated runtime: ~{estimated_minutes} minutes\n"
+
+            # Add credential warning if likely needed but not provided
+            if credentials_likely_needed and not credentials_provided:
+                output += "\nThis test involves checkout/login flows which typically require authentication.\n"
+                output += "Does the user have test account credentials to provide?\n"
+
+            output += f"\nPlan ID: {plan_id}\n"
+            output += "\nPlease confirm this plan with the user before running."
+
+            logger.info(f"Created experiment plan: {plan_id}")
+            return [TextContent(type="text", text=output)]
+
+        except Exception as e:
+            error_msg = f"Error planning experiment: {str(e)}"
+            logger.exception("Error in plan_experiment")
+            return [TextContent(type="text", text=error_msg)]
+
+    async def _confirm_and_run_experiment(self, arguments: dict) -> list[TextContent]:
+        """Run a previously planned experiment.
+
+        Args:
+            arguments: Dictionary with plan_id and optional credentials
+
+        Returns:
+            List containing experiment creation result
+        """
+        try:
+            # Clean up old plans first
+            self._cleanup_old_plans()
+
+            # Ensure authenticated
+            if not await self._ensure_authenticated(arguments):
+                return [TextContent(
+                    type="text",
+                    text="Error: Not authenticated. Please provide email and password, or call whoami first."
+                )]
+
+            plan_id = arguments.get("plan_id", "").strip()
+            if not plan_id:
+                return [TextContent(type="text", text="Error: plan_id is required")]
+
+            # Retrieve plan
+            plan = self.pending_plans.get(plan_id)
+            if not plan:
+                return [TextContent(
+                    type="text",
+                    text=f"Error: Plan '{plan_id}' not found or expired. Plans expire after 1 hour."
+                )]
+
+            # Get authenticated client
+            client = self.session_manager.get_client()
+
+            # Check for credentials override
+            credential_username = arguments.get("credential_username", "").strip() or plan.credential_username
+            credential_password = arguments.get("credential_password", "").strip() or plan.credential_password
+
+            # Build credentials string if provided
+            credentials = None
+            if credential_username or credential_password:
+                credentials = f"username: {credential_username}, password: {credential_password}"
+
+            logger.info(f"Running experiment from plan: {plan_id}")
+
+            # Create experiment payload
+            experiment_payload = {
+                "title": plan.title,
+                "hypothesis": plan.hypothesis,
+                "goal": plan.goal,
+                "url": plan.url,
+                "experiment_type_id": plan.experiment_type_id,
+                "persona_ids": plan.persona_ids,
+                "frame_type": plan.frame_type,
+                "status": "Draft",
+                "credentials": credentials,
+            }
+
+            # Create experiment
+            logger.info("Creating experiment...")
+            create_response = await client.post("/experiments", json=experiment_payload)
+
+            experiment_id = create_response.get("data", [{}])[0].get("experiment_id")
+            if not experiment_id:
+                return [TextContent(type="text", text="Error: Failed to get experiment ID from response")]
+
+            # Run experiment
+            logger.info(f"Running experiment {experiment_id}...")
+            run_response = await client.post(f"/experiments/{experiment_id}/run")
+
+            # Remove plan from storage
+            del self.pending_plans[plan_id]
+
+            if run_response.get("status") == "success":
+                # Calculate estimated runtime
+                num_personas = len(plan.persona_ids)
+                estimated_minutes = round(5 + 7.2 * (0.5 + num_personas))
+
+                result = f"""Experiment created and started successfully!
+
+Experiment ID: {experiment_id}
+Title: {plan.title}
+URL: {plan.url}
+Personas: {num_personas}
+Estimated Runtime: {estimated_minutes} minutes
+
+Status: Running
+
+The experiment is now running in the background. You can check results later using:
+get_experiment_results(experiment_id="{experiment_id}")
+
+Or view it in the web interface at:
+{config.web_url}/experiments/{experiment_id}"""
+
+                logger.info(f"Experiment {experiment_id} started successfully from plan {plan_id}")
+                return [TextContent(type="text", text=result)]
+            else:
+                error_msg = run_response.get("message", "Unknown error")
+                return [TextContent(type="text", text=f"Experiment created but failed to start: {error_msg}")]
+
+        except Exception as e:
+            error_msg = f"Error running experiment: {str(e)}"
+            logger.exception("Error in confirm_and_run_experiment")
+            return [TextContent(type="text", text=error_msg)]
+
+    async def _plan_experiment_from_description(self, arguments: dict) -> list[TextContent]:
+        """Plan an experiment from natural language description without running it.
+
+        Args:
+            arguments: Dictionary with test_description, url, persona_ids, etc.
+
+        Returns:
+            List containing experiment plan summary with plan_id
+        """
+        try:
+            # Clean up old plans first
+            self._cleanup_old_plans()
+
+            # Ensure authenticated
+            if not await self._ensure_authenticated(arguments):
+                return [TextContent(
+                    type="text",
+                    text="Error: Not authenticated. Provide email/password or call whoami first."
+                )]
+
+            client = self.session_manager.get_client()
+
+            # Extract and validate parameters
+            test_description = arguments.get("test_description", "").strip()
+            url = arguments.get("url", "").strip()
+            persona_ids = arguments.get("persona_ids", [])
+            frame_type = arguments.get("frame_type", "Desktop")
+            credential_username = arguments.get("credential_username", "").strip() or None
+            credential_password = arguments.get("credential_password", "").strip() or None
+
+            if not test_description:
+                return [TextContent(type="text", text="Error: test_description required")]
+            if not url:
+                return [TextContent(type="text", text="Error: url required")]
+            if not persona_ids or len(persona_ids) == 0:
+                return [TextContent(type="text", text="Error: At least one persona_id required")]
+
+            # Normalize URL
+            if not url.startswith("http://") and not url.startswith("https://"):
+                url = f"https://{url}"
+
+            logger.info(f"Planning experiment for: '{test_description}' at {url}")
+
+            # Generate structured fields from test description
+            hypothesis = f"Can users {test_description}?"
+            goal = f"Users should {test_description}"
+
+            # Generate title: capitalize first 4-6 words
+            title_words = test_description.split()[:5]
+            title = " ".join(title_words).title()
+
+            # Fetch personas and experiment types
+            personas_response = await client.get("/personas", params={"limit": 100})
+            all_personas = personas_response.get("personas", personas_response) if isinstance(personas_response, dict) else personas_response
+            selected_personas = [p for p in all_personas if p.get("id") in persona_ids]
+            persona_names = [p.get("name", "Unknown") for p in selected_personas]
+
+            exp_types_response = await client.get("/experiments/types")
+
+            # Call /experiments/types/suggest to get experiment_type_id
+            suggest_payload = {
+                "experimentTitle": title,
+                "hypothesis": hypothesis,
+                "goal": goal,
+                "url": url,
+                "frame_type": frame_type,
+                "personas": [
+                    {
+                        "id": p.get("id"),
+                        "name": p.get("name", ""),
+                        "description": p.get("description", ""),
+                        "traits": p.get("traits", {}),
+                        "tendencies": p.get("tendencies", []),
+                        "participants": p.get("participants", 0),
+                    }
+                    for p in selected_personas
+                ],
+                "availableExperimentTypes": [
+                    {
+                        "id": et.get("id"),
+                        "name": et.get("name"),
+                        "instructions": et.get("instructions"),
+                        "success_indicators": None,
+                        "prompt_specifics": None,
+                    }
+                    for et in exp_types_response
+                ],
+            }
+
+            suggest_result = await client.post("/experiments/types/suggest", json=suggest_payload)
+            experiment_type_id = suggest_result.get("suggested_experiment_type_id")
+
+            if not experiment_type_id:
+                return [TextContent(type="text", text="Error: Failed to determine experiment type")]
+
+            # Get experiment type name
+            experiment_type_name = ""
+            for et in exp_types_response:
+                if et.get("id") == experiment_type_id:
+                    experiment_type_name = et.get("name", "")
+                    break
+
+            # Check if credentials are likely needed
+            credentials_provided = bool(credential_username or credential_password)
+            credentials_likely_needed = self._suggest_credentials_needed(url, goal, hypothesis)
+
+            # Generate plan ID
+            plan_id = f"plan_{uuid.uuid4().hex[:12]}"
+
+            # Store plan
+            plan = ExperimentPlan(
+                plan_id=plan_id,
+                created_at=datetime.now(),
+                title=title,
+                hypothesis=hypothesis,
+                goal=goal,
+                url=url,
+                experiment_type_id=experiment_type_id,
+                experiment_type_name=experiment_type_name,
+                persona_ids=persona_ids,
+                persona_names=persona_names,
+                frame_type=frame_type,
+                credentials_provided=credentials_provided,
+                credential_username=credential_username,
+                credential_password=credential_password,
+                credentials_likely_needed=credentials_likely_needed,
+            )
+            self.pending_plans[plan_id] = plan
+
+            # Calculate estimated runtime
+            num_personas = len(persona_ids)
+            estimated_minutes = round(5 + 7.2 * (0.5 + num_personas))
+
+            # Build output
+            output = "I've prepared an experiment plan:\n\n"
+            output += f"Title: {title}\n"
+            output += f"URL: {url}\n"
+            output += f"Goal: {goal}\n"
+            output += f"Hypothesis: {hypothesis}\n"
+            output += f"Personas: {', '.join(persona_names)}\n"
+            output += f"Device: {frame_type}\n"
+
+            if credentials_provided:
+                output += f"Credentials: Configured (username: {credential_username})\n"
+
+            output += f"Estimated runtime: ~{estimated_minutes} minutes\n"
+
+            # Add credential warning if likely needed but not provided
+            if credentials_likely_needed and not credentials_provided:
+                output += "\nThis test involves checkout/login flows which typically require authentication.\n"
+                output += "Does the user have test account credentials to provide?\n"
+
+            output += f"\nPlan ID: {plan_id}\n"
+            output += "\nPlease confirm this plan with the user before running."
+
+            logger.info(f"Created experiment plan from description: {plan_id}")
+            return [TextContent(type="text", text=output)]
+
+        except Exception as e:
+            error_msg = f"Error planning experiment: {str(e)}"
+            logger.exception("Error in plan_experiment_from_description")
             return [TextContent(type="text", text=error_msg)]
 
     async def run(self):
